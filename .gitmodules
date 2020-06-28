@@ -1,8 +1,4 @@
-[submodule "seqan3"]
-	path = lib/seqan3
-	url = https://github.com/seqan/seqan3.git
-	branch = master
 [submodule "lib/seqan3"]
 	path = lib/seqan3
 	url = https://github.com/eseiler/seqan3
-	branch = feature/binning_directory
+	branch = feature/pp_tbd
