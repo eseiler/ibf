@@ -1,3 +1,5 @@
+#include <seqan3/std/charconv>
+
 #include <seqan3/argument_parser/all.hpp>
 #include <seqan3/io/sequence_file/input.hpp>
 #include <seqan3/range/views/get.hpp>
@@ -13,7 +15,9 @@ struct cmd_arguments
     uint8_t k{20};
     uint64_t bins{64};
     uint64_t bits{4096};
+    std::string size{};
     uint64_t hash{2};
+    uint8_t threads{1};
     bool gz{false};
     bool bz2{false};
 };
@@ -43,7 +47,8 @@ void run_program(cmd_arguments & args)
 
     seqan3::ibf_config cfg{seqan3::bin_count{args.bins},
                            seqan3::bin_size{args.bits},
-                           seqan3::hash_function_count{args.hash}};
+                           seqan3::hash_function_count{args.hash},
+                           args.threads};
 
     seqan3::technical_binning_directory tbd{technical_bins, seqan3::views::kmer_hash(seqan3::ungapped{args.k}), cfg};
 
@@ -64,10 +69,13 @@ void initialize_argument_parser(seqan3::argument_parser & parser, cmd_arguments 
                       seqan3::option_spec::DEFAULT);
     parser.add_option(args.k, '\0', "kmer", "Choose the kmer size.", seqan3::option_spec::DEFAULT,
                       seqan3::arithmetic_range_validator{1, 32});
-    parser.add_option(args.bins, '\0', "bins", "Choose the number of bins.", seqan3::option_spec::DEFAULT,
+    parser.add_option(args.threads, '\0', "threads", "Choose the number of threads.", seqan3::option_spec::DEFAULT,
+                      seqan3::arithmetic_range_validator{1, 2048});
+    parser.add_option(args.bins, '\0', "bins", "Choose the number of bins.", seqan3::option_spec::REQUIRED,
                       seqan3::arithmetic_range_validator{1, 65536});
-    parser.add_option(args.bits, '\0', "bits", "Choose the size in bits of one bin.", seqan3::option_spec::DEFAULT,
-                      seqan3::arithmetic_range_validator{1, 35184372088832});
+    parser.add_option(args.bits, '\0', "bits", "Choose the size in bits of one bin. Mutually exclusive with --size.",
+                      seqan3::option_spec::DEFAULT, seqan3::arithmetic_range_validator{1, 35184372088832});
+    parser.add_option(args.size, '\0', "size", "Choose the size of the resulting IBF. Mutually exclusive with --bits.");
     parser.add_option(args.hash, '\0', "hash", "Choose the number of hashes.", seqan3::option_spec::DEFAULT,
                       seqan3::arithmetic_range_validator{1, 4});
     parser.add_flag(args.gz, '\0', "gz", "Expect FASTA files to be gz compressed.");
@@ -91,6 +99,39 @@ int main(int argc, char ** argv)
 
     if (args.gz && args.bz2)
         throw seqan3::argument_parser_error{"Files cannot be both gz and bz2 compressed."};
+
+    args.size.erase(std::remove(args.size.begin(), args.size.end(), ' '), args.size.end());
+
+    if (args.bits != 4096u && !args.size.empty()) // Probably not default. https://github.com/seqan/seqan3/pull/1859
+        throw seqan3::argument_parser_error{"Either set --bits or --size."};
+
+    if (!args.size.empty())
+    {
+        size_t multiplier{};
+
+        switch (std::tolower(args.size.back()))
+        {
+            case 't':
+                multiplier = 8ull * 1024ull * 1024ull * 1024ull * 1024ull;
+                break;
+            case 'g':
+                multiplier = 8ull * 1024ull * 1024ull * 1024ull;
+                break;
+            case 'm':
+                multiplier = 8ull * 1024ull * 1024ull;
+                break;
+            case 'k':
+                multiplier = 8ull * 1024ull;
+                break;
+            default:
+                throw seqan3::argument_parser_error{"Use {k, m, g, t} to pass size. E.g., --size 8g."};
+        }
+
+        size_t size{};
+        std::from_chars(args.size.data(), args.size.data() + args.size.size() - 1, size);
+        size *= multiplier;
+        args.bits = size / args.bins;
+    }
 
     run_program(args);
     return 0;
