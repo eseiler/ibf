@@ -7,6 +7,11 @@
 #include <seqan3/range/views/move.hpp>
 #include <seqan3/search/dream_index/technical_binning_directory.hpp>
 
+struct my_traits : seqan3::sequence_file_input_default_traits_dna
+{
+    using sequence_alphabet = seqan3::dna4;
+};
+
 struct cmd_arguments
 {
     std::filesystem::path bin_path{};
@@ -20,41 +25,116 @@ struct cmd_arguments
     uint8_t threads{1};
     bool gz{false};
     bool bz2{false};
+    uint8_t parts{1u};
 };
 
-struct my_traits : seqan3::sequence_file_input_default_traits_dna
+struct tbd_generator
 {
-    using sequence_alphabet = seqan3::dna4;
+    cmd_arguments const * arguments;
+
+    auto operator()()
+    {
+        std::string extension{".fasta"};
+        if (arguments->gz)
+            extension += ".gz";
+        if (arguments->bz2)
+            extension += ".bz2";
+
+        using sequence_file_t = seqan3::sequence_file_input<my_traits, seqan3::fields<seqan3::field::seq>>;
+
+        auto technical_bins = std::views::iota(0u, arguments->bins) |
+                              std::views::transform([&] (size_t const i) {
+                                return sequence_file_t{arguments->bin_path / ("bin_" + std::to_string(i) + extension)} |
+                                       seqan3::views::persist |
+                                       seqan3::views::get<seqan3::field::seq> |
+                                       seqan3::views::move;
+                              });
+
+        seqan3::ibf_config cfg{seqan3::bin_count{arguments->bins},
+                            seqan3::bin_size{arguments->bits / arguments->parts},
+                            seqan3::hash_function_count{arguments->hash},
+                            arguments->threads};
+
+        return seqan3::technical_binning_directory{technical_bins,
+                                                   seqan3::views::kmer_hash(seqan3::ungapped{arguments->k}),
+                                                   cfg};
+    }
+
+    auto operator()(auto && hash_restrict_view)
+    {
+        std::string extension{".fasta"};
+        if (arguments->gz)
+            extension += ".gz";
+        if (arguments->bz2)
+            extension += ".bz2";
+
+        using sequence_file_t = seqan3::sequence_file_input<my_traits, seqan3::fields<seqan3::field::seq>>;
+
+        auto technical_bins = std::views::iota(0u, arguments->bins) |
+                              std::views::transform([&] (size_t const i) {
+                                return sequence_file_t{arguments->bin_path / ("bin_" + std::to_string(i) + extension)} |
+                                       seqan3::views::persist |
+                                       seqan3::views::get<seqan3::field::seq> |
+                                       seqan3::views::move;
+                              });
+
+        seqan3::ibf_config cfg{seqan3::bin_count{arguments->bins},
+                            seqan3::bin_size{arguments->bits / arguments->parts},
+                            seqan3::hash_function_count{arguments->hash},
+                            arguments->threads};
+
+        return seqan3::technical_binning_directory{technical_bins,
+                                                   seqan3::views::kmer_hash(seqan3::ungapped{arguments->k}) |
+                                                   hash_restrict_view,
+                                                   cfg};
+    }
 };
 
 void run_program(cmd_arguments & args)
 {
-    std::string extension{".fasta"};
-    if (args.gz)
-        extension += ".gz";
-    if (args.bz2)
-        extension += ".bz2";
+    tbd_generator generator{&args};
 
-    using sequence_file_t = seqan3::sequence_file_input<my_traits, seqan3::fields<seqan3::field::seq>>;
+    if (args.parts == 1u)
+    {
+        auto tbd = generator();
+        std::ofstream os{args.out_path, std::ios::binary};
+        cereal::BinaryOutputArchive oarchive{os};
+        oarchive(tbd);
+    }
+    else
+    {
+        std::vector<std::vector<size_t>> association(args.parts);
 
-    auto technical_bins = std::views::iota(0u, args.bins) |
-                          std::views::transform([&] (size_t const i) {
-                                return sequence_file_t{args.bin_path / ("bin_" + std::to_string(i) + extension)} |
-                                       seqan3::views::persist |
-                                       seqan3::views::get<seqan3::field::seq> |
-                                       seqan3::views::move;
-                          });
+        if (args.parts == 4u) // one-to-one
+        {
+            for (size_t i : std::views::iota(0u, args.parts))
+                association[i] = std::vector<size_t>{i};
+        }
+        else if (args.parts == 2u) // More than 1 prefix per part
+        {
+            association[0] = std::vector<size_t>{0, 1};
+            association[1] = std::vector<size_t>{1, 2};
+        }
+        else // Multiple prefixes per part
+        {
+            size_t parts_per_prefix = args.parts / 4u;
+            for (size_t i : std::views::iota(0u, args.parts))
+                association[i] = std::vector<size_t>{i/parts_per_prefix};
+        }
 
-    seqan3::ibf_config cfg{seqan3::bin_count{args.bins},
-                           seqan3::bin_size{args.bits},
-                           seqan3::hash_function_count{args.hash},
-                           args.threads};
+        for (size_t part : std::views::iota(0u, args.parts))
+        {
+            auto filter_view = std::views::filter([&] (auto && hash)
+                { return std::ranges::find(association[part], hash >> (2*args.k)) != association[part].end(); });
 
-    seqan3::technical_binning_directory tbd{technical_bins, seqan3::views::kmer_hash(seqan3::ungapped{args.k}), cfg};
-
-    std::ofstream os{args.out_path, std::ios::binary};
-    cereal::BinaryOutputArchive oarchive{os};
-    oarchive(tbd);
+            auto tbd = generator(filter_view);
+            std::filesystem::path out_path{args.out_path};
+            out_path += "_" + std::to_string(part);
+            std::ofstream os{out_path, std::ios::binary};
+            cereal::BinaryOutputArchive oarchive{os};
+            oarchive(tbd);
+        }
+    }
 }
 
 void initialize_argument_parser(seqan3::argument_parser & parser, cmd_arguments & args)
@@ -76,6 +156,7 @@ void initialize_argument_parser(seqan3::argument_parser & parser, cmd_arguments 
     parser.add_option(args.bits, '\0', "bits", "Choose the size in bits of one bin. Mutually exclusive with --size.",
                       seqan3::option_spec::DEFAULT, seqan3::arithmetic_range_validator{1, 35184372088832});
     parser.add_option(args.size, '\0', "size", "Choose the size of the resulting IBF. Mutually exclusive with --bits.");
+    parser.add_option(args.parts, '\0', "parts", "Splits the IBF in this many parts. Must be a power of 2.");
     parser.add_option(args.hash, '\0', "hash", "Choose the number of hashes.", seqan3::option_spec::DEFAULT,
                       seqan3::arithmetic_range_validator{1, 4});
     parser.add_flag(args.gz, '\0', "gz", "Expect FASTA files to be gz compressed.");
