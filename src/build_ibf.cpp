@@ -2,6 +2,7 @@
 
 #include <seqan3/argument_parser/all.hpp>
 #include <seqan3/io/sequence_file/input.hpp>
+#include <seqan3/range/views/async_input_buffer.hpp>
 #include <seqan3/range/views/get.hpp>
 #include <seqan3/range/views/persist.hpp>
 #include <seqan3/range/views/move.hpp>
@@ -42,20 +43,18 @@ struct tbd_generator
 
         using sequence_file_t = seqan3::sequence_file_input<my_traits, seqan3::fields<seqan3::field::seq>>;
 
-        auto technical_bins = std::views::iota(0u, arguments->bins) |
-                              std::views::transform([&] (size_t const i) {
-                                return sequence_file_t{arguments->bin_path / ("bin_" + std::to_string(i) + extension)} |
-                                       seqan3::views::persist |
-                                       seqan3::views::get<seqan3::field::seq> |
-                                       seqan3::views::move;
-                              });
+        std::vector<sequence_file_t> technical_bins;
+        technical_bins.reserve(arguments->bins);
+
+        for (size_t i = 0; i < arguments->bins; ++i)
+            technical_bins.emplace_back(arguments->bin_path / ("bin_" + std::to_string(i) + extension));
 
         seqan3::ibf_config cfg{seqan3::bin_count{arguments->bins},
-                            seqan3::bin_size{arguments->bits / arguments->parts},
-                            seqan3::hash_function_count{arguments->hash},
-                            arguments->threads};
+                               seqan3::bin_size{arguments->bits / arguments->parts},
+                               seqan3::hash_function_count{arguments->hash},
+                               arguments->threads};
 
-        return seqan3::technical_binning_directory{technical_bins,
+        return seqan3::technical_binning_directory{std::move(technical_bins),
                                                    seqan3::views::kmer_hash(seqan3::ungapped{arguments->k}),
                                                    cfg};
     }
@@ -70,18 +69,16 @@ struct tbd_generator
 
         using sequence_file_t = seqan3::sequence_file_input<my_traits, seqan3::fields<seqan3::field::seq>>;
 
-        auto technical_bins = std::views::iota(0u, arguments->bins) |
-                              std::views::transform([&] (size_t const i) {
-                                return sequence_file_t{arguments->bin_path / ("bin_" + std::to_string(i) + extension)} |
-                                       seqan3::views::persist |
-                                       seqan3::views::get<seqan3::field::seq> |
-                                       seqan3::views::move;
-                              });
+        std::vector<sequence_file_t> technical_bins;
+        technical_bins.reserve(arguments->bins);
+
+        for (size_t i = 0; i < arguments->bins; ++i)
+            technical_bins.emplace_back(arguments->bin_path / ("bin_" + std::to_string(i) + extension));
 
         seqan3::ibf_config cfg{seqan3::bin_count{arguments->bins},
-                            seqan3::bin_size{arguments->bits / arguments->parts},
-                            seqan3::hash_function_count{arguments->hash},
-                            arguments->threads};
+                               seqan3::bin_size{arguments->bits / arguments->parts},
+                               seqan3::hash_function_count{arguments->hash},
+                               arguments->threads};
 
         return seqan3::technical_binning_directory{technical_bins,
                                                    seqan3::views::kmer_hash(seqan3::ungapped{arguments->k}) |
@@ -104,6 +101,7 @@ void run_program(cmd_arguments & args)
     else
     {
         std::vector<std::vector<size_t>> association(args.parts);
+        size_t next_power_of_four{4u};
 
         if (args.parts == 4u) // one-to-one
         {
@@ -113,19 +111,26 @@ void run_program(cmd_arguments & args)
         else if (args.parts == 2u) // More than 1 prefix per part
         {
             association[0] = std::vector<size_t>{0, 1};
-            association[1] = std::vector<size_t>{1, 2};
+            association[1] = std::vector<size_t>{2, 3};
         }
         else // Multiple prefixes per part
         {
-            size_t parts_per_prefix = args.parts / 4u;
-            for (size_t i : std::views::iota(0u, args.parts))
-                association[i] = std::vector<size_t>{i/parts_per_prefix};
+            // How long must the suffix be such that 4^suffix_length >= args.parts
+            size_t suffix_length{0};
+            for (; 0b100 << (2 * suffix_length) < args.parts; ++suffix_length) {}
+            next_power_of_four = 0b100 << (2 * suffix_length);
+
+            size_t const prefixes_per_part = next_power_of_four / args.parts;
+
+            for (size_t i : std::views::iota(0u, next_power_of_four))
+                association[i/prefixes_per_part].push_back(i);
         }
 
         for (size_t part : std::views::iota(0u, args.parts))
         {
+            size_t const mask{next_power_of_four - 1};
             auto filter_view = std::views::filter([&] (auto && hash)
-                { return std::ranges::find(association[part], hash >> (2*args.k)) != association[part].end(); });
+                { return std::ranges::find(association[part], hash & mask) != association[part].end(); });
 
             auto tbd = generator(filter_view);
             std::filesystem::path out_path{args.out_path};
@@ -211,7 +216,7 @@ int main(int argc, char ** argv)
         size_t size{};
         std::from_chars(args.size.data(), args.size.data() + args.size.size() - 1, size);
         size *= multiplier;
-        args.bits = size / args.bins;
+        args.bits = size / (((args.bins + 63) >> 6) << 6);
     }
 
     run_program(args);

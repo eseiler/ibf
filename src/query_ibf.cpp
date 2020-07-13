@@ -1,6 +1,5 @@
+#include <chrono>
 #include <mutex>
-
-#include <seqan3/core/debug_stream.hpp>
 
 #include <seqan3/argument_parser/all.hpp>
 #include <seqan3/io/sequence_file/input.hpp>
@@ -18,6 +17,7 @@ struct cmd_arguments
     uint8_t threads{1};
     uint64_t pattern_size{};
     uint8_t parts{1u};
+    bool write_time{false};
 };
 
 struct my_traits : seqan3::sequence_file_input_default_traits_dna
@@ -49,25 +49,37 @@ private:
 };
 
 template <typename t>
-void load_ibf(t & tbd, cmd_arguments const & args, size_t const part)
+void load_ibf(t & tbd, cmd_arguments const & args, size_t const part, double & ibf_io_time)
 {
     std::filesystem::path ibf_file{args.ibf_file};
     ibf_file += "_" + std::to_string(part);
     std::ifstream is{ibf_file, std::ios::binary};
     cereal::BinaryInputArchive iarchive{is};
+    auto start = std::chrono::high_resolution_clock::now();
     iarchive(tbd);
+    auto end = std::chrono::high_resolution_clock::now();
+    ibf_io_time += std::chrono::duration_cast<std::chrono::duration<double>>(end - start).count();
 }
 
 template <typename t>
-inline void do_parallel(t && worker, size_t const threads)
+inline void do_parallel(t && worker, size_t const num_records, size_t const threads, double & compute_time)
 {
-    std::vector<decltype(std::async(std::launch::async, worker))> tasks;
+    auto start = std::chrono::high_resolution_clock::now();
+    std::vector<decltype(std::async(std::launch::async, worker, size_t{}, size_t{}))> tasks;
+    size_t const records_per_thread = num_records / threads;
 
     for (size_t i = 0; i < threads; ++i)
-        tasks.emplace_back(std::async(std::launch::async, worker));
+    {
+        size_t const start = records_per_thread * i;
+        size_t const end = i == (threads-1) ? num_records: records_per_thread * (i+1);
+        tasks.emplace_back(std::async(std::launch::async, worker, start, end));
+    }
 
     for (auto && task : tasks)
         task.wait();
+
+    auto end = std::chrono::high_resolution_clock::now();
+    compute_time += std::chrono::duration_cast<std::chrono::duration<double>>(end - start).count();
 }
 
 void run_program_multiple(cmd_arguments const & args)
@@ -86,65 +98,71 @@ void run_program_multiple(cmd_arguments const & args)
     using record_type = typename decltype(fin)::record_type;
     std::vector<record_type> records{};
 
-    for (auto && chunked_records : fin | seqan3::views::chunk(10'000'000))
-    {
-        records.clear();
-        std::ranges::copy(chunked_records, std::cpp20::back_inserter(records));
+    double ibf_io_time{0.0};
+    double reads_io_time{0.0};
+    double compute_time{0.0};
 
-        load_ibf(tbd, args, 0);
+    auto cereal_worker = [&] ()
+    {
+        load_ibf(tbd, args, 0, ibf_io_time);
+    };
+
+    for (auto && chunked_records : fin | seqan3::views::chunk((1ULL<<20)*10))
+    {
+        auto cereal_handle = std::async(std::launch::async, cereal_worker);
+
+        records.clear();
+        auto start = std::chrono::high_resolution_clock::now();
+        std::ranges::move(chunked_records, std::cpp20::back_inserter(records));
+        auto end = std::chrono::high_resolution_clock::now();
+        reads_io_time += std::chrono::duration_cast<std::chrono::duration<double>>(end - start).count();
 
         std::vector<seqan3::counting_vector<uint16_t>> counts(records.size(),
                                                               seqan3::counting_vector<uint16_t>(tbd.bin_count(), 0));
 
-        auto zipped_input = seqan3::views::zip(records, std::views::iota(0u)) | seqan3::views::async_input_buffer(std::max<size_t>(args.threads * 4, 8));
-
-        auto count_task = [&]()
+        auto count_task = [&](size_t const start, size_t const end)
         {
             auto counter = tbd.counting_agent<uint16_t>();
+            size_t counter_id = start;
 
-            for (auto && x : zipped_input)
+            for (auto && [id, seq] : records | seqan3::views::slice(start, end))
             {
-                auto && [id, seq] = get<0>(x);
-                size_t i = get<1>(x);
                 auto & result = counter.count_query(seq);
-                counts[i] += result;
+                counts[counter_id++] += result;
             }
         };
 
-        do_parallel(count_task, args.threads);
+        cereal_handle.wait();
+        do_parallel(count_task, records.size(), args.threads, compute_time);
 
         for (size_t const part : std::views::iota(1u, static_cast<unsigned int>(args.parts - 1)))
         {
-            load_ibf(tbd, args, part);
-
-            zipped_input = seqan3::views::zip(records, std::views::iota(0u)) | seqan3::views::async_input_buffer(std::max<size_t>(args.threads * 4, 8));
-            do_parallel(count_task, args.threads);
+            load_ibf(tbd, args, part, ibf_io_time);
+            do_parallel(count_task, records.size(), args.threads, compute_time);
         }
 
-        load_ibf(tbd, args, args.parts - 1);
-        zipped_input = seqan3::views::zip(records, std::views::iota(0u)) | seqan3::views::async_input_buffer(std::max<size_t>(args.threads * 4, 8));
+        load_ibf(tbd, args, args.parts - 1, ibf_io_time);
         sync_out synced_out{args.out_file};
         uint16_t const threshold = args.kmer_size * (args.errors + 1) < args.pattern_size ?
                                        args.pattern_size - (args.kmer_size * (args.errors + 1)) + 1 : 1;
 
-        auto output_task = [&]()
+        auto output_task = [&](size_t const start, size_t const end)
         {
             auto counter = tbd.counting_agent<uint16_t>();
+            size_t counter_id = start;
             std::string result_string{};
 
-            for (auto && x : zipped_input)
+            for (auto && [id, seq] : records | seqan3::views::slice(start, end))
             {
-                auto && [id, seq] = get<0>(x);
-                size_t i = get<1>(x);
                 auto & result = counter.count_query(seq);
-                counts[i] += result;
+                counts[counter_id] += result;
 
                 result_string.clear();
                 result_string += id;
                 result_string += '\t';
 
                 size_t current_bin{0};
-                for (auto const & count : counts[i])
+                for (auto && count : counts[counter_id++])
                 {
                     if (count >= threshold)
                     {
@@ -158,7 +176,20 @@ void run_program_multiple(cmd_arguments const & args)
             }
         };
 
-        do_parallel(output_task, args.threads);
+        do_parallel(output_task, records.size(), args.threads, compute_time);
+    }
+
+    if (args.write_time)
+    {
+        std::filesystem::path file_path{args.out_file};
+        file_path += ".time";
+        std::ofstream file_handle{file_path};
+        file_handle << "IBF I/O\tReads I/O\tCompute\n";
+        file_handle << std::fixed
+                    << std::setprecision(2)
+                    << ibf_io_time << '\t'
+                    << reads_io_time << '\t'
+                    << compute_time;
     }
 }
 
@@ -174,25 +205,34 @@ void run_program_single(cmd_arguments const & args)
 
     std::ifstream is{args.ibf_file, std::ios::binary};
     cereal::BinaryInputArchive iarchive{is};
-    iarchive(tbd);
+
+    double ibf_io_time{0.0};
+    double reads_io_time{0.0};
+    double compute_time{0.0};
+
+    auto cereal_worker = [&] ()
+    {
+        auto start = std::chrono::high_resolution_clock::now();
+        iarchive(tbd);
+        auto end = std::chrono::high_resolution_clock::now();
+        ibf_io_time += std::chrono::duration_cast<std::chrono::duration<double>>(end - start).count();
+    };
+    auto cereal_handle = std::async(std::launch::async, cereal_worker);
 
     seqan3::sequence_file_input<my_traits, seqan3::fields<seqan3::field::id, seqan3::field::seq>> fin{args.query_file};
-
-    // create the async buffer around the input file
-    // spawns a background thread that tries to keep eight records in the buffer
-    auto sequence_input_buffer = fin | seqan3::views::async_input_buffer(std::max<size_t>(args.threads * 4, 8));
+    using record_type = typename decltype(fin)::record_type;
+    std::vector<record_type> records{};
 
     sync_out synced_out{args.out_file};
-    size_t const threshold = args.kmer_size * (args.errors + 1) < args.pattern_size ? args.pattern_size - (args.kmer_size * (args.errors + 1)) + 1 : 1;
+    size_t const threshold = args.kmer_size * (args.errors + 1) < args.pattern_size ?
+                                args.pattern_size - (args.kmer_size * (args.errors + 1)) + 1 : 1;
 
-    // create a lambda function that iterates over the async buffer when called
-    // (the buffer gets dynamically refilled as soon as possible)
-    auto worker = [&] ()
+    auto worker = [&] (size_t const start, size_t const end)
     {
-        auto counter = tbd.counting_agent();
+        auto counter = tbd.counting_agent<uint16_t>();
         std::string result_string{};
 
-        for (auto && [id, seq] : sequence_input_buffer)
+        for (auto && [id, seq] : records | seqan3::views::slice(start, end))
         {
             result_string.clear();
             result_string += id;
@@ -200,7 +240,7 @@ void run_program_single(cmd_arguments const & args)
 
             auto & result = counter.count_query(seq);
             size_t current_bin{0};
-            for (auto const & count : result)
+            for (auto && count : result)
             {
                 if (count >= threshold)
                 {
@@ -214,7 +254,31 @@ void run_program_single(cmd_arguments const & args)
         }
     };
 
-    do_parallel(worker, args.threads);
+    for (auto && chunked_records : fin | seqan3::views::chunk((1ULL<<20)*10))
+    {
+        records.clear();
+        auto start = std::chrono::high_resolution_clock::now();
+        std::ranges::move(chunked_records, std::cpp20::back_inserter(records));
+        auto end = std::chrono::high_resolution_clock::now();
+        reads_io_time += std::chrono::duration_cast<std::chrono::duration<double>>(end - start).count();
+
+        cereal_handle.wait();
+
+        do_parallel(worker, records.size(), args.threads, compute_time);
+    }
+
+    if (args.write_time)
+    {
+        std::filesystem::path file_path{args.out_file};
+        file_path += ".time";
+        std::ofstream file_handle{file_path};
+        file_handle << "IBF I/O\tReads I/O\tCompute\n";
+        file_handle << std::fixed
+                    << std::setprecision(2)
+                    << ibf_io_time << '\t'
+                    << reads_io_time << '\t'
+                    << compute_time;
+    }
 }
 
 void initialize_argument_parser(seqan3::argument_parser & parser, cmd_arguments & args)
@@ -236,6 +300,7 @@ void initialize_argument_parser(seqan3::argument_parser & parser, cmd_arguments 
                       seqan3::arithmetic_range_validator{0, 5});
     parser.add_option(args.pattern_size, '\0', "pattern",
                       "Choose the pattern size. Default: Use median of sequence lengths in query file.");
+    parser.add_flag(args.write_time, '\0', "time", "Write timing file.", seqan3::option_spec::ADVANCED);
 }
 
 int main(int argc, char ** argv)
