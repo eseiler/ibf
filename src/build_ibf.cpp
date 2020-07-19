@@ -169,7 +169,7 @@ void initialize_argument_parser(seqan3::argument_parser & parser, cmd_arguments 
     parser.add_option(args.parts, '\0', "parts", "Splits the IBF in this many parts. Must be a power of 2.");
     parser.add_option(args.hash, '\0', "hash", "Choose the number of hashes.", seqan3::option_spec::DEFAULT,
                       seqan3::arithmetic_range_validator{1, 4});
-    parser.add_option(args.compressed, '\0', "compressed", "Build a compressed IBF.");
+    parser.add_flag(args.compressed, '\0', "compressed", "Build a compressed IBF.");
     parser.add_flag(args.gz, '\0', "gz", "Expect FASTA files to be gz compressed.");
     parser.add_flag(args.bz2, '\0', "bz2", "Expect FASTA files to be bz2 compressed.");
 }

@@ -60,11 +60,11 @@ struct ibf_builder
         seqan3::ibf_config cfg{seqan3::bin_count{64u},
                                seqan3::bin_size{1024u},
                                seqan3::hash_function_count{2u}};
-
         auto view = seqan3::views::kmer_hash(seqan3::ungapped{kmer_size});
         return seqan3::technical_binning_directory{std::vector<std::vector<seqan3::dna4>>{},
                                                    std::move(view),
-                                                   cfg};
+                                                   cfg,
+                                                   true};
     }
 
     auto ibf()
@@ -328,7 +328,7 @@ void initialize_argument_parser(seqan3::argument_parser & parser, cmd_arguments 
                       seqan3::arithmetic_range_validator{0, 5});
     parser.add_option(args.pattern_size, '\0', "pattern",
                       "Choose the pattern size. Default: Use median of sequence lengths in query file.");
-    parser.add_option(args.compressed, '\0', "compressed", "Build a compressed IBF.");
+    parser.add_flag(args.compressed, '\0', "compressed", "Build a compressed IBF.");
     parser.add_flag(args.write_time, '\0', "time", "Write timing file.", seqan3::option_spec::ADVANCED);
 }
 
@@ -361,16 +361,16 @@ int main(int argc, char ** argv)
 
     if (args.parts == 1)
     {
-        // if (args.compressed)
-            // run_program_single<true>(args);
-        // else
+        if (args.compressed)
+            run_program_single<true>(args);
+        else
             run_program_single<false>(args);
     }
     else
     {
-        // if (args.compressed)
-            // run_program_multiple<true>(args);
-        // else
+        if (args.compressed)
+            run_program_multiple<true>(args);
+        else
             run_program_multiple<false>(args);
     }
 
