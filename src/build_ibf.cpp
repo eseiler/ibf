@@ -24,16 +24,19 @@ struct cmd_arguments
     std::string size{};
     uint64_t hash{2};
     uint8_t threads{1};
+    bool compressed{false};
     bool gz{false};
     bool bz2{false};
     uint8_t parts{1u};
 };
 
-struct tbd_generator
+template <bool compressed>
+struct ibf_builder
 {
     cmd_arguments const * arguments;
 
-    auto operator()()
+    template <typename view_t = std::ranges::empty_view<int>>
+    auto construct(view_t && restrict_view = std::ranges::empty_view<int>())
     {
         std::string extension{".fasta"};
         if (arguments->gz)
@@ -54,55 +57,48 @@ struct tbd_generator
                                seqan3::hash_function_count{arguments->hash},
                                arguments->threads};
 
-        auto view = seqan3::views::kmer_hash(seqan3::ungapped{arguments->k});
-        auto tbd = seqan3::technical_binning_directory{std::move(technical_bins),
-                                                       std::move(view),
+        if constexpr (std::same_as<view_t, std::ranges::empty_view<int>>)
+        {
+            return seqan3::technical_binning_directory{std::move(technical_bins),
+                                                       seqan3::views::kmer_hash(seqan3::ungapped{arguments->k}),
                                                        cfg};
-
-        return seqan3::technical_binning_directory<seqan3::data_layout::compressed,
-                                                   decltype(view),
-                                                   seqan3::dna4>{std::move(tbd)};
+        }
+        else
+        {
+            return seqan3::technical_binning_directory{std::move(technical_bins),
+                                                       seqan3::views::kmer_hash(seqan3::ungapped{arguments->k}) |
+                                                           restrict_view,
+                                                       cfg};
+        }
     }
 
-    auto operator()(auto && hash_restrict_view)
+    template <typename view_t = std::ranges::empty_view<int>>
+        requires !compressed
+    auto ibf(view_t && restrict_view = std::ranges::empty_view<int>())
     {
-        std::string extension{".fasta"};
-        if (arguments->gz)
-            extension += ".gz";
-        if (arguments->bz2)
-            extension += ".bz2";
+        return construct(std::move(restrict_view));
+    }
 
-        using sequence_file_t = seqan3::sequence_file_input<my_traits, seqan3::fields<seqan3::field::seq>>;
-
-        std::vector<sequence_file_t> technical_bins;
-        technical_bins.reserve(arguments->bins);
-
-        for (size_t i = 0; i < arguments->bins; ++i)
-            technical_bins.emplace_back(arguments->bin_path / ("bin_" + std::to_string(i) + extension));
-
-        seqan3::ibf_config cfg{seqan3::bin_count{arguments->bins},
-                               seqan3::bin_size{arguments->bits / arguments->parts},
-                               seqan3::hash_function_count{arguments->hash},
-                               arguments->threads};
-
-        auto view = seqan3::views::kmer_hash(seqan3::ungapped{arguments->k}) | hash_restrict_view;
-        auto tbd =  seqan3::technical_binning_directory{technical_bins,
-                                                        std::move(view),
-                                                        cfg};
+    template <typename view_t = std::ranges::empty_view<int>>
+        requires compressed
+    auto ibf(view_t && restrict_view = std::ranges::empty_view<int>())
+    {
+        auto tmp = construct(std::move(restrict_view));
 
         return seqan3::technical_binning_directory<seqan3::data_layout::compressed,
-                                                   decltype(view),
-                                                   seqan3::dna4>{std::move(tbd)};
+                                                   typename decltype(tmp)::hash_adaptor_t,
+                                                   seqan3::dna4>{std::move(tmp)};
     }
 };
 
+template <bool compressed>
 void run_program(cmd_arguments & args)
 {
-    tbd_generator generator{&args};
+    ibf_builder<compressed> generator{&args};
 
     if (args.parts == 1u)
     {
-        auto tbd = generator();
+        auto tbd = generator.ibf();
         std::ofstream os{args.out_path, std::ios::binary};
         cereal::BinaryOutputArchive oarchive{os};
         oarchive(tbd);
@@ -141,7 +137,7 @@ void run_program(cmd_arguments & args)
             auto filter_view = std::views::filter([&] (auto && hash)
                 { return std::ranges::find(association[part], hash & mask) != association[part].end(); });
 
-            auto tbd = generator(filter_view);
+            auto tbd = generator.ibf(filter_view);
             std::filesystem::path out_path{args.out_path};
             out_path += "_" + std::to_string(part);
             std::ofstream os{out_path, std::ios::binary};
@@ -173,6 +169,7 @@ void initialize_argument_parser(seqan3::argument_parser & parser, cmd_arguments 
     parser.add_option(args.parts, '\0', "parts", "Splits the IBF in this many parts. Must be a power of 2.");
     parser.add_option(args.hash, '\0', "hash", "Choose the number of hashes.", seqan3::option_spec::DEFAULT,
                       seqan3::arithmetic_range_validator{1, 4});
+    parser.add_option(args.compressed, '\0', "compressed", "Build a compressed IBF.");
     parser.add_flag(args.gz, '\0', "gz", "Expect FASTA files to be gz compressed.");
     parser.add_flag(args.bz2, '\0', "bz2", "Expect FASTA files to be bz2 compressed.");
 }
@@ -228,6 +225,9 @@ int main(int argc, char ** argv)
         args.bits = size / (((args.bins + 63) >> 6) << 6);
     }
 
-    run_program(args);
+    if (args.compressed)
+        run_program<true>(args);
+    else
+        run_program<false>(args);
     return 0;
 }
