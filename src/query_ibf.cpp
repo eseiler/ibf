@@ -17,6 +17,7 @@ struct cmd_arguments
     uint8_t threads{1};
     uint64_t pattern_size{};
     uint8_t parts{1u};
+    bool compressed{false};
     bool write_time{false};
 };
 
@@ -46,6 +47,41 @@ public:
 private:
     std::ofstream file;
     std::mutex write_mutex;
+};
+
+
+template <bool compressed>
+struct ibf_builder
+{
+    uint8_t const kmer_size;
+
+    auto construct()
+    {
+        seqan3::ibf_config cfg{seqan3::bin_count{64u},
+                               seqan3::bin_size{1024u},
+                               seqan3::hash_function_count{2u}};
+
+        auto view = seqan3::views::kmer_hash(seqan3::ungapped{kmer_size});
+        return seqan3::technical_binning_directory{std::vector<std::vector<seqan3::dna4>>{},
+                                                   std::move(view),
+                                                   cfg};
+    }
+
+    auto ibf()
+        requires !compressed
+    {
+        return construct();
+    }
+
+    auto ibf()
+        requires compressed
+    {
+        auto tmp = construct();
+
+        return seqan3::technical_binning_directory<seqan3::data_layout::compressed,
+                                                   typename decltype(tmp)::hash_adaptor_t,
+                                                   seqan3::dna4>{std::move(tmp)};
+    }
 };
 
 template <typename t>
@@ -82,22 +118,13 @@ inline void do_parallel(t && worker, size_t const num_records, size_t const thre
     compute_time += std::chrono::duration_cast<std::chrono::duration<double>>(end - start).count();
 }
 
+template <bool compressed>
 void run_program_multiple(cmd_arguments const & args)
 {
     using std::get;
 
-    seqan3::ibf_config cfg{seqan3::bin_count{64u},
-                           seqan3::bin_size{1024u},
-                           seqan3::hash_function_count{2u}};
-
-    auto view = seqan3::views::kmer_hash(seqan3::ungapped{args.kmer_size});
-    seqan3::technical_binning_directory tmp{std::vector<std::vector<seqan3::dna4>>{},
-                                            std::move(view),
-                                            cfg};
-
-    seqan3::technical_binning_directory<seqan3::data_layout::compressed,
-                                        decltype(view),
-                                        seqan3::dna4> tbd{std::move(tmp)};
+    ibf_builder<compressed> builder{args.kmer_size};
+    auto tbd = builder.ibf();
 
     seqan3::sequence_file_input<my_traits, seqan3::fields<seqan3::field::id, seqan3::field::seq>> fin{args.query_file};
     using record_type = typename decltype(fin)::record_type;
@@ -127,7 +154,7 @@ void run_program_multiple(cmd_arguments const & args)
 
         auto count_task = [&](size_t const start, size_t const end)
         {
-            auto counter = tbd.counting_agent<uint16_t>();
+            auto counter = tbd.template counting_agent<uint16_t>();
             size_t counter_id = start;
 
             for (auto && [id, seq] : records | seqan3::views::slice(start, end))
@@ -153,7 +180,7 @@ void run_program_multiple(cmd_arguments const & args)
 
         auto output_task = [&](size_t const start, size_t const end)
         {
-            auto counter = tbd.counting_agent<uint16_t>();
+            auto counter = tbd.template counting_agent<uint16_t>();
             size_t counter_id = start;
             std::string result_string{};
 
@@ -198,20 +225,11 @@ void run_program_multiple(cmd_arguments const & args)
     }
 }
 
+template <bool compressed>
 void run_program_single(cmd_arguments const & args)
 {
-    seqan3::ibf_config cfg{seqan3::bin_count{64u},
-                           seqan3::bin_size{1024u},
-                           seqan3::hash_function_count{2u}};
-
-    auto view = seqan3::views::kmer_hash(seqan3::ungapped{args.kmer_size});
-    seqan3::technical_binning_directory tmp{std::vector<std::vector<seqan3::dna4>>{},
-                                            std::move(view),
-                                            cfg};
-
-    seqan3::technical_binning_directory<seqan3::data_layout::compressed,
-                                        decltype(view),
-                                        seqan3::dna4> tbd{std::move(tmp)};
+    ibf_builder<compressed> builder{args.kmer_size};
+    auto tbd = builder.ibf();
 
     std::ifstream is{args.ibf_file, std::ios::binary};
     cereal::BinaryInputArchive iarchive{is};
@@ -239,7 +257,7 @@ void run_program_single(cmd_arguments const & args)
 
     auto worker = [&] (size_t const start, size_t const end)
     {
-        auto counter = tbd.counting_agent<uint16_t>();
+        auto counter = tbd.template counting_agent<uint16_t>();
         std::string result_string{};
 
         for (auto && [id, seq] : records | seqan3::views::slice(start, end))
@@ -310,6 +328,7 @@ void initialize_argument_parser(seqan3::argument_parser & parser, cmd_arguments 
                       seqan3::arithmetic_range_validator{0, 5});
     parser.add_option(args.pattern_size, '\0', "pattern",
                       "Choose the pattern size. Default: Use median of sequence lengths in query file.");
+    parser.add_option(args.compressed, '\0', "compressed", "Build a compressed IBF.");
     parser.add_flag(args.write_time, '\0', "time", "Write timing file.", seqan3::option_spec::ADVANCED);
 }
 
@@ -341,9 +360,19 @@ int main(int argc, char ** argv)
     }
 
     if (args.parts == 1)
-        run_program_single(args);
+    {
+        // if (args.compressed)
+            // run_program_single<true>(args);
+        // else
+            run_program_single<false>(args);
+    }
     else
-        run_program_multiple(args);
+    {
+        // if (args.compressed)
+            // run_program_multiple<true>(args);
+        // else
+            run_program_multiple<false>(args);
+    }
 
     return 0;
 }
