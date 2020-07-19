@@ -54,9 +54,14 @@ struct tbd_generator
                                seqan3::hash_function_count{arguments->hash},
                                arguments->threads};
 
-        return seqan3::technical_binning_directory{std::move(technical_bins),
-                                                   seqan3::views::kmer_hash(seqan3::ungapped{arguments->k}),
-                                                   cfg};
+        auto view = seqan3::views::kmer_hash(seqan3::ungapped{arguments->k});
+        auto tbd = seqan3::technical_binning_directory{std::move(technical_bins),
+                                                       std::move(view),
+                                                       cfg};
+
+        return seqan3::technical_binning_directory<seqan3::data_layout::compressed,
+                                                   decltype(view),
+                                                   seqan3::dna4>{std::move(tbd)};
     }
 
     auto operator()(auto && hash_restrict_view)
@@ -80,10 +85,14 @@ struct tbd_generator
                                seqan3::hash_function_count{arguments->hash},
                                arguments->threads};
 
-        return seqan3::technical_binning_directory{technical_bins,
-                                                   seqan3::views::kmer_hash(seqan3::ungapped{arguments->k}) |
-                                                   hash_restrict_view,
-                                                   cfg};
+        auto view = seqan3::views::kmer_hash(seqan3::ungapped{arguments->k}) | hash_restrict_view;
+        auto tbd =  seqan3::technical_binning_directory{technical_bins,
+                                                        std::move(view),
+                                                        cfg};
+
+        return seqan3::technical_binning_directory<seqan3::data_layout::compressed,
+                                                   decltype(view),
+                                                   seqan3::dna4>{std::move(tbd)};
     }
 };
 

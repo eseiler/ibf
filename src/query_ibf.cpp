@@ -90,9 +90,14 @@ void run_program_multiple(cmd_arguments const & args)
                            seqan3::bin_size{1024u},
                            seqan3::hash_function_count{2u}};
 
-    seqan3::technical_binning_directory tbd{std::vector<std::vector<seqan3::dna4>>{},
-                                            seqan3::views::kmer_hash(seqan3::ungapped{args.kmer_size}),
+    auto view = seqan3::views::kmer_hash(seqan3::ungapped{args.kmer_size});
+    seqan3::technical_binning_directory tmp{std::vector<std::vector<seqan3::dna4>>{},
+                                            std::move(view),
                                             cfg};
+
+    seqan3::technical_binning_directory<seqan3::data_layout::compressed,
+                                        decltype(view),
+                                        seqan3::dna4> tbd{std::move(tmp)};
 
     seqan3::sequence_file_input<my_traits, seqan3::fields<seqan3::field::id, seqan3::field::seq>> fin{args.query_file};
     using record_type = typename decltype(fin)::record_type;
@@ -199,9 +204,14 @@ void run_program_single(cmd_arguments const & args)
                            seqan3::bin_size{1024u},
                            seqan3::hash_function_count{2u}};
 
-    seqan3::technical_binning_directory tbd{std::vector<std::vector<seqan3::dna4>>{},
-                                            seqan3::views::kmer_hash(seqan3::ungapped{args.kmer_size}),
+    auto view = seqan3::views::kmer_hash(seqan3::ungapped{args.kmer_size});
+    seqan3::technical_binning_directory tmp{std::vector<std::vector<seqan3::dna4>>{},
+                                            std::move(view),
                                             cfg};
+
+    seqan3::technical_binning_directory<seqan3::data_layout::compressed,
+                                        decltype(view),
+                                        seqan3::dna4> tbd{std::move(tmp)};
 
     std::ifstream is{args.ibf_file, std::ios::binary};
     cereal::BinaryInputArchive iarchive{is};
